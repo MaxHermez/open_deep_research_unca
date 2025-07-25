@@ -3,6 +3,7 @@ import aiohttp
 import asyncio
 import logging
 import warnings
+from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Literal, Dict, Optional, Any
 from langchain_core.tools import BaseTool, StructuredTool, tool, ToolException, InjectedToolArg
@@ -16,7 +17,7 @@ from mcp import McpError
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from open_deep_research.state import Summary, ResearchComplete
 from open_deep_research.configuration import SearchAPI, Configuration
-from open_deep_research.prompts import summarize_webpage_prompt
+from open_deep_research.prompts import summarize_webpage_prompt, summarize_supabase_prompt
 
 
 ##########################
@@ -112,12 +113,45 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
     try:
         summary = await asyncio.wait_for(
             model.ainvoke([HumanMessage(content=summarize_webpage_prompt.format(webpage_content=webpage_content, date=get_today_str()))]),
-            timeout=60.0
+            timeout=180.0
         )
         return f"""<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"""
     except (asyncio.TimeoutError, Exception) as e:
         print(f"Failed to summarize webpage: {str(e)}")
         return webpage_content
+
+class SupabaseSummary(BaseModel):
+    '''Represents a summary of Supabase search results.'''
+    summary: str
+    key_excerpts: List[str]
+
+async def summarize_supabase_results(model: BaseChatModel, query: str, rag_results: List[Dict]) -> str:
+    """Summarize Supabase RAG search results using the summarization model."""
+    # Format results for the prompt
+    formatted_results = []
+    for result in rag_results:
+        formatted_results.append({
+            "sc_id": result.get('id', ''),
+            "section_title": result.get('metadata', {}).get('section_title', ''),
+            "doc_title": result.get('metadata', {}).get('doc_title', ''),
+            "text": result.get('content', '')
+        })
+    summary = await asyncio.wait_for(
+        model.ainvoke([HumanMessage(content=summarize_supabase_prompt.format(
+            query=query,
+            rag_results=formatted_results,
+            date=get_today_str()
+        ))]),
+        timeout=180.0
+    )
+
+    # Format the response similar to webpage summarization
+    excerpts_text = ""
+    if hasattr(summary, 'key_excerpts') and summary.key_excerpts:
+        for excerpt in summary.key_excerpts:
+            excerpts_text += f"[{excerpt.sc_id}] {excerpt.excerpt}\n"
+
+    return f"""<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{excerpts_text}</key_excerpts>"""
 
 
 ##########################
@@ -204,10 +238,14 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
         def _find_first_mcp_error_nested(exc: BaseException) -> McpError | None:
             if isinstance(exc, McpError):
                 return exc
-            if isinstance(exc, ExceptionGroup):
-                for sub_exc in exc.exceptions:
-                    if found := _find_first_mcp_error_nested(sub_exc):
-                        return found
+            # Handle ExceptionGroup for Python 3.11+
+            try:
+                if hasattr(exc, 'exceptions'):  # ExceptionGroup-like behavior
+                    for sub_exc in exc.exceptions:
+                        if found := _find_first_mcp_error_nested(sub_exc):
+                            return found
+            except AttributeError:
+                pass
             return None
         try:
             return await old_coroutine(**kwargs)
@@ -281,6 +319,10 @@ async def get_search_tool(search_api: SearchAPI):
         return [{"type": "web_search_preview"}]
     elif search_api == SearchAPI.TAVILY:
         search_tool = tavily_search
+        search_tool.metadata = {**(search_tool.metadata or {}), "type": "search", "name": "web_search"}
+        return [search_tool]
+    elif search_api == SearchAPI.SUPABASE:
+        search_tool = supabase_search
         search_tool.metadata = {**(search_tool.metadata or {}), "type": "search", "name": "web_search"}
         return [search_tool]
     elif search_api == SearchAPI.NONE:
@@ -448,7 +490,8 @@ def remove_up_to_last_ai_message(messages: list[MessageLikeRepresentation]) -> l
 ##########################
 def get_today_str() -> str:
     """Get current date in a human-readable format."""
-    return datetime.now().strftime("%a %b %-d, %Y")
+    # return datetime.now().strftime("%a %b %-d, %Y")
+    return datetime.now().strftime("%Y-%m-%d")
 
 def get_config_value(value):
     if value is None:
@@ -492,3 +535,161 @@ def get_tavily_api_key(config: RunnableConfig):
         return api_keys.get("TAVILY_API_KEY")
     else:
         return os.getenv("TAVILY_API_KEY")
+
+
+SUPABASE_RAG_SEARCH_DESCRIPTION = (
+    "A semantic search engine that searches through a curated knowledge base using RAG (Retrieval Augmented Generation). "
+    "Useful for finding detailed information from pre-indexed documents and research materials."
+)
+
+@tool(description=SUPABASE_RAG_SEARCH_DESCRIPTION)
+async def supabase_search(
+    queries: List[str],
+    match_count: Annotated[int, InjectedToolArg] = 5,
+    match_threshold: Annotated[float, InjectedToolArg] = 0.5,
+    config: RunnableConfig = None
+) -> str:
+    """
+    Fetches results from Supabase RAG search using semantic similarity.
+
+    Args:
+        queries (List[str]): List of search queries, you can pass in as many queries as you need.
+        match_count (int): Maximum number of results to return per query
+        match_threshold (float): Similarity threshold for matching (0-1)
+
+    Returns:
+        str: A formatted string of search results
+    """
+    try:
+        from supabase import create_client, Client
+        import openai
+        
+        # Initialize clients
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        if not supabase_url or not supabase_key:
+            return "Error: SUPABASE_URL and SUPABASE_KEY environment variables are required"
+        
+        if not openai_api_key:
+            return "Error: OPENAI_API_KEY environment variable is required for embeddings"
+        
+        supabase: Client = create_client(supabase_url, supabase_key)
+        openai_client = openai.OpenAI(api_key=openai_api_key)
+        
+    except ImportError:
+        return "Error: supabase-py and openai packages are required for Supabase RAG search"
+    
+    # Get configuration for summarization
+    configurable = Configuration.from_runnable_config(config)
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    summarization_model = init_chat_model(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(Summary).with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+    
+    # Collect all results from all queries
+    all_results = []
+    formatted_output = f"Search results from knowledge base: \n\n"
+    
+    for query_idx, query in enumerate(queries):
+        try:
+            # Generate embedding for the query
+            embedding_response = openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=query
+            )
+            query_embedding = embedding_response.data[0].embedding
+            
+            # Call Supabase RPC function
+            response = supabase.rpc(
+                'match_section_chunks',
+                {
+                    'query_embedding': query_embedding,
+                    'match_count': match_count,
+                    'filter': {}  # Empty filter as per RPC signature
+                }
+            ).execute()
+            
+            # Filter results by similarity threshold
+            filtered_results = [
+                doc for doc in response.data 
+                if doc.get('similarity', 0) >= match_threshold
+            ]
+            
+            if filtered_results:
+                # Add query context to results
+                for result in filtered_results:
+                    result['query'] = query
+                all_results.extend(filtered_results)
+                
+        except Exception as e:
+            formatted_output += f"\n--- QUERY {query_idx + 1}: {query} ---\n"
+            formatted_output += f"Error: {str(e)}\n\n"
+    
+    if not all_results:
+        return "No relevant results found in the knowledge base. Please try different search queries or adjust the similarity threshold."
+    
+    # Group results by query and summarize
+    async def noop():
+        return None
+        
+    # Group results by query for summarization
+    results_by_query = {}
+    for result in all_results:
+        query = result['query']
+        if query not in results_by_query:
+            results_by_query[query] = []
+        results_by_query[query].append(result)
+    
+    # Summarize results for each query
+    summarization_tasks = []
+    for query, query_results in results_by_query.items():
+        if query_results:
+            summarization_tasks.append(
+                summarize_supabase_results(summarization_model, query, query_results)
+            )
+        else:
+            summarization_tasks.append(noop())
+    
+    summaries = await asyncio.gather(*summarization_tasks)
+    
+    # Format the final output
+    for i, (query, summary) in enumerate(zip(results_by_query.keys(), summaries)):
+        query_results = results_by_query[query]
+        formatted_output += f"\n--- QUERY {i + 1}: {query} ---\n"
+        formatted_output += f"Found {len(query_results)} relevant results\n\n"
+        
+        if summary and summary != "":
+            formatted_output += f"SUMMARY:\n{summary}\n\n"
+        else:
+            # Fallback to basic formatting if summarization failed
+            for j, doc in enumerate(query_results):
+                metadata = doc.get('metadata', {})
+                doc_title = metadata.get('doc_title', '')
+                section_title = metadata.get('section_title', '')
+                sc_id = doc.get('sc_id', '')
+                
+                if doc_title and section_title:
+                    title = f"{doc_title} - Section: {section_title}"
+                elif doc_title:
+                    title = doc_title
+                elif section_title:
+                    title = section_title
+                else:
+                    title = f"Document Chunk {j+1}"
+                
+                content = doc.get('content', '')
+                similarity = doc.get('similarity', 0.0)
+
+                formatted_output += f"SOURCE {j + 1}: {sc_id}\n"
+                formatted_output += f"Title: {title}\n"
+                formatted_output += f"Relevance: {similarity:.3f}\n"
+                formatted_output += f"CONTENT:\n{content[:1000]}{'...' if len(content) > 1000 else ''}\n\n"
+        
+        formatted_output += "-" * 80 + "\n\n"
+    
+    return formatted_output

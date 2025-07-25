@@ -17,9 +17,21 @@ class ConductResearch(BaseModel):
 class ResearchComplete(BaseModel):
     """Call this tool to indicate that the research is complete."""
 
+class Excerpt(BaseModel):
+    sc_id: str = Field(
+        description="A unique identifier for the excerpt.",
+    )
+    excerpt: str = Field(
+        description="The text of the excerpt.",
+    )
+
 class Summary(BaseModel):
-    summary: str
-    key_excerpts: str
+    summary: str = Field(
+        description="A summary of the research conducted.",
+    )
+    key_excerpts: list[Excerpt] = Field(
+        description="Key excerpts from the research.",
+    )
 
 class ClarifyWithUser(BaseModel):
     need_clarification: bool = Field(
