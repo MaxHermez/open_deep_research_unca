@@ -166,6 +166,8 @@ You can use any of the tools provided to you to find resources that can help ans
 1. If you haven't conducted any searches yet, start with broad searches to get necessary context and background information. Once you have some background, you can start to narrow down your searches to get more specific information.
 2. Different topics require different levels of research depth. If the question is broad, your research can be more shallow, and you may not need to iterate and call tools as many times.
 3. If the question is detailed, you may need to be more stingy about the depth of your findings, and you may need to iterate and call tools more times to get a fully detailed answer.
+4. Always prioritize finding numbers, statistics, and data points that are central to the content's message with your queries. Avoid vague or generic queries, and instead focus on specific aspects of the topic that can yield concrete information.
+5. Avoid using data that is older than 2023. To get more recent data, you can include the year in your query, e.g. "2023" or "2023 2024 2025" to get the most recent data.
 </Helpful Tips>
 
 <Critical Reminders>
@@ -202,12 +204,12 @@ The report should be structured like this:
 </Output Format>
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
+- Assign each unique ID a single citation number in your text
 - End with ### Sources that lists each source with corresponding numbers
 - IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
 - Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
+  [1] ID: sc_1234567890
+  [2] ID: sc_0987654321
 </Citation Rules>
 
 Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
@@ -236,51 +238,33 @@ Please create a detailed answer to the overall research brief that:
 4. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
 5. Includes a "Sources" section at the end with all referenced links
 
-You can structure your report in a number of different ways. Here are some examples:
+You can structure your report in a number of different ways. Here's an example structure for your report:
 
-To answer a question that asks you to compare two things, you might structure your report like this:
-1/ intro
-2/ overview of topic A
-3/ overview of topic B
-4/ comparison between A and B
-5/ conclusion
-
-To answer a question that asks you to return a list of things, you might only need a single section which is the entire list.
-1/ list of things or table of things
-Or, you could choose to make each item in the list a separate section in the report. When asked for lists, you don't need an introduction or conclusion.
-1/ item 1
-2/ item 2
-3/ item 3
-
-To answer a question that asks you to summarize a topic, give a report, or give an overview, you might structure your report like this:
-1/ overview of topic
-2/ concept 1
-3/ concept 2
-4/ concept 3
-5/ conclusion
-
-If you think you can answer the question with a single section, you can do that too!
-1/ answer
+1/ Introduction: Briefly introduce the selected national development challenge/opportunity.
+2/ Current State: Present the current situation, supporting it with at least one data point or statistic (with proper references).
+3/ Implications: Analyze the implications for Albania's development, referencing relevant SDGs and affected LNOB groups.
+4/ Strategies: Outline potential strategies for addressing the challenge/opportunity, noting alignments with the six global transitions and circular-economy interventions where relevant.
+5/ Conclusion: Summarize key findings and recommendations.
 
 REMEMBER: Section is a VERY fluid and loose concept. You can structure your report however you think is best, including in ways that are not listed above!
 Make sure that your sections are cohesive, and make sense for the reader.
 
 For each section of the report, do the following:
 - Use simple, clear language
-- Use ## for section title (Markdown format) for each section of the report
-- Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language. 
+- Use ## for section title (Markdown format) for each section of the report. But try to limit the number of sections to 4 very long and thorough sections at most. This is to try to keep the report as cohesive narrative instead of a list of facts.
+- Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language.
 - Do not say what you are doing in the report. Just write the report without any commentary from yourself.
 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
-- Assign each unique URL a single citation number in your text
+- Assign each unique ID a single citation number in your text
 - End with ### Sources that lists each source with corresponding numbers
 - IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
 - Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
 - Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
+  [1] ID: sc_1234567890
+  [2] ID: sc_0987654321
 - Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
 </Citation Rules>
 """
@@ -341,6 +325,54 @@ Example 2 (for a scientific article):
 ```
 
 Remember, your goal is to create a summary that can be easily understood and utilized by a downstream research agent while preserving the most critical information from the original webpage.
+
+Today's date is {date}.
+"""
+
+summarize_supabase_prompt = """You are tasked with synthesising the raw content returned by a Retrieval-Augmented Generation (RAG) search.  
+The downstream research agent needs a concise yet complete picture of the material, so preserve every detail that truly matters while eliminating duplication and filler.
+
+<query>
+{query}
+</query>
+
+<rag_results>
+{rag_results}
+</rag_results>
+
+Guidelines
+1. **Main idea first** - capture the overall topic or purpose implicit in the whole result-set.
+2. **Facts, figures, dates** - keep every number, percentage, name, date, and location that drives the point home in your excerpts.
+3. **Quotes** - if a chunk contains a vivid or authoritative line, preserve it verbatim.
+4. **Chronology** - if events unfold over time, present them in that order.
+5. **Lists / steps** - keep them as lists if they convey procedure or enumeration.
+6. **Deduplicate** - different chunks may repeat or partially overlap; do not echo the same sentence twice.
+7. **Attribution** - when you lift an excerpt, tag it with its `sc_id` so later agents can trace it.
+8. **Length target** - aim for roughly 10-25 % of the combined length of all `text` fields (unless the input is already short).
+
+Special-case hints  
+* **News-like**: emphasise who/what/when/where/why/how.  
+* **Scientific / statistical**: retain methodology, key results, and conclusions.  
+* **Opinion / analysis**: keep the core argument and supporting evidence.  
+* **Instructions / product info**: preserve step-by-step or spec lists intact.
+
+**Output format (JSON)**
+
+```json
+{{
+    "summary": "Put the synthesized narrative here - paragraphs or bullet-points are both fine.",
+    "key_excerpts": [
+        {{
+            "sc_id": "sc_xxxx",
+            "excerpt": "First critical quote or sentence or data..."
+        }},
+        {{
+            "sc_id": "sc_yyyy",
+            "excerpt": "Second critical quote or sentence or data..."
+        }} // up to 5 total
+    ]
+}}
+```
 
 Today's date is {date}.
 """
