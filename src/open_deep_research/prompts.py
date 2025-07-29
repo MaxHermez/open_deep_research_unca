@@ -269,6 +269,45 @@ Format the report in clear markdown with proper structure and include source ref
 </Citation Rules>
 """
 
+final_report_rewriting_prompt = """Based on the existing draft, create an edited narrative-format version to the overall draft, which is based on the research brief:
+
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+Here is the last draft of the research report:
+<Last Draft>
+{last_draft}
+</Last Draft>
+
+Please create an edited version from the last draft that:
+1. In narrative format. Think like a journalist writing a story, not a structured and sectioned report (as is the draft)
+2. Includes all the same specific facts, insights, points, and citations from the research. Your job is not to come up with new ideas and points, but to create the same report in a different format.
+3. References relevant sources in the exact same format as the Last Draft.
+4. Includes the "Sources" section at the end with all referenced links
+
+For each section of the report, do the following:
+- Use simple, clear language
+- Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language.
+- Do not say what you are doing in the report. Just write the report without any commentary from yourself.
+
+Format the report in clear markdown with proper structure and include source references where the Last Draft includes them.
+
+<Citation Rules>
+- Assign each unique ID a single citation number in your text
+- End with ### Sources that lists each source with corresponding numbers
+- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
+- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
+- Do not bunche many claims under long citation strings (e.g., “[1][2][3][4][5][6]”). Keep keep the citation and claims or data points pairing exactly as it is in the Last Draft.
+- Example format:
+  [1] ID: sc_1234567890
+  [2] ID: sc_0987654321
+- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+</Citation Rules>
+
+**REMEMBER**
+Try to keep each citation next its intended data point, not at the end of each paragrpah. The [X] numbered citations should be in the same contextual position as it was in the Last Draft."""
+
 
 summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 

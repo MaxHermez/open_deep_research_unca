@@ -26,6 +26,7 @@ from open_deep_research.prompts import (
     compress_research_system_prompt,
     compress_research_simple_human_message,
     final_report_generation_prompt,
+    final_report_rewriting_prompt,
     lead_researcher_prompt
 )
 from open_deep_research.utils import (
@@ -355,13 +356,69 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         **cleared_state
     }
 
+async def final_report_narrative(state: AgentState, config: RunnableConfig):
+    notes = state.get("notes", [])
+    cleared_state = {"notes": {"type": "override", "value": []},}
+    configurable = Configuration.from_runnable_config(config)
+    writer_model_config = {
+        "model": configurable.final_report_model,
+        "max_tokens": configurable.final_report_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.research_model, config),
+    }
+    
+    findings = "\n".join(notes)
+    max_retries = 3
+    current_retry = 0
+    while current_retry <= max_retries:
+        final_report_prompt = final_report_rewriting_prompt.format(
+            research_brief=state.get("research_brief", ""),
+            findings=findings,
+            date=get_today_str(),
+            last_draft=state.get("final_report", "")
+        )
+        try:
+            final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
+            return {
+                "final_report": final_report.content, 
+                "messages": [final_report],
+                **cleared_state
+            }
+        except Exception as e:
+            if is_token_limit_exceeded(e, configurable.final_report_model):
+                if current_retry == 0:
+                    model_token_limit = get_model_token_limit(configurable.final_report_model)
+                    if not model_token_limit:
+                        return {
+                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
+                            **cleared_state
+                        }
+                    findings_token_limit = model_token_limit * 4
+                else:
+                    findings_token_limit = int(findings_token_limit * 0.9)
+                print("Reducing the chars to", findings_token_limit)
+                findings = findings[:findings_token_limit]
+                current_retry += 1
+            else:
+                # If not a token limit exceeded error, then we just throw an error.
+                return {
+                    "final_report": f"Error generating final report: {e}",
+                    **cleared_state
+                }
+    return {
+        "final_report": "Error generating final report: Maximum retries exceeded",
+        "messages": [final_report],
+        **cleared_state
+    }
+
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
+deep_researcher_builder.add_node("final_report_narrative", final_report_narrative)
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
-deep_researcher_builder.add_edge("final_report_generation", END)
+deep_researcher_builder.add_edge("final_report_generation", "final_report_narrative")
+deep_researcher_builder.add_edge("final_report_narrative", END)
 
 deep_researcher = deep_researcher_builder.compile()
