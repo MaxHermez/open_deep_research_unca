@@ -66,23 +66,26 @@ class AgentInputState(MessagesState):
 class AgentState(MessagesState):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], operator.add]
     research_brief: Optional[str]
-    raw_notes: Annotated[list[str], override_reducer] = []
-    notes: Annotated[list[str], override_reducer] = []
+    editor_messages: Annotated[list[MessageLikeRepresentation], operator.add] = []  # type: ignore
+    raw_notes: Annotated[list[str], override_reducer] = []  # type: ignore
+    notes: Annotated[list[str], override_reducer] = []  # type: ignore
     final_report: str
+    refined_drafts: list[str] = []  # type: ignore
+    final_narrative: Optional[str]
 
 class SupervisorState(TypedDict):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], operator.add]
     research_brief: str
-    notes: Annotated[list[str], override_reducer] = []
-    research_iterations: int = 0
-    raw_notes: Annotated[list[str], override_reducer] = []
+    notes: Annotated[list[str], override_reducer] = []  # type: ignore
+    research_iterations: int = 0  # type: ignore
+    raw_notes: Annotated[list[str], override_reducer] = []  # type: ignore
 
 class ResearcherState(TypedDict):
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
-    tool_call_iterations: int = 0
+    tool_call_iterations: int = 0  # type: ignore
     research_topic: str
     compressed_research: str
-    raw_notes: Annotated[list[str], override_reducer] = []
+    raw_notes: Annotated[list[str], override_reducer] = []  # type: ignore
 
 class ResearcherOutputState(BaseModel):
     compressed_research: str

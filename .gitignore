@@ -67,3 +67,8 @@ tmp/
 temp/
 
 .langgraph_api
+indicators/*
+prompts/*
+src/open_deep_research/drafts/*
+src/open_deep_research/fault_trees/*
+indicators*

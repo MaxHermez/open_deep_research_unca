@@ -1,9 +1,13 @@
 import os
+import re
+import openai
+from supabase import create_client, Client
 import aiohttp
 import asyncio
 import logging
 import warnings
 from pydantic import BaseModel
+from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Literal, Dict, Optional, Any
 from langchain_core.tools import BaseTool, StructuredTool, tool, ToolException, InjectedToolArg
@@ -18,7 +22,12 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from open_deep_research.state import Summary, ResearchComplete
 from open_deep_research.configuration import SearchAPI, Configuration
 from open_deep_research.prompts import summarize_webpage_prompt, summarize_supabase_prompt
+from open_deep_research.logging_config import setup_logging
 
+load_dotenv()
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 ##########################
 # Tavily Search Tool Utils
@@ -693,3 +702,127 @@ async def supabase_search(
         formatted_output += "-" * 80 + "\n\n"
     
     return formatted_output
+
+def md_cite_sc_ids(text: str):
+    ID_PATTERN     = r'\[?\^?\d+\]?\.?\sID:\s*(sc_[^\s,)]+)'        # capture group 1  ->  sc_xxxxxxx
+    PAREN_PATTERN  = r'\(([^)]*ID:\s*sc_[^)]*)\)'  # any (…) that contains at least one ID:
+    # PAREN_PATTERN = r'(?<!^\d\.\s)\(([^)]*ID:\s*sc_[^)]*)\)'
+    BARE_FOOTNOTE  = r'\[(?!\^)(\d+)\]'
+    # 1) collect IDs in first-appearance order ----------------------------
+    sc_id_matches = re.findall(ID_PATTERN, text)
+    unique_sc_ids = []
+    for m in sc_id_matches:
+        if m not in unique_sc_ids:
+            unique_sc_ids.append(m)
+    footnote_map = {sc_id: i + 1 for i, sc_id in enumerate(unique_sc_ids)}
+
+    # 2) replace IDs that live inside parentheses -------------------------
+    text = re.sub(PAREN_PATTERN, '', text).strip()
+
+    # 3) replace any remaining standalone IDs -----------------------------
+    text = re.sub(ID_PATTERN, '', text).strip()
+
+    # 4) convert bare numeric refs like “[1]” → “[^^1]” -------------------
+    text = re.sub(BARE_FOOTNOTE, r'[^\1]', text).strip()
+
+    # 5) append the footnote block ----------------------------------------
+    footnotes = [f'[^{num}]: {sc_id}' for sc_id, num in footnote_map.items()]
+    text += '\n\n' + '\n'.join(footnotes).strip()
+    return text, footnote_map
+
+def _normalize_title(s: str) -> str:
+    # Casefold, trim, collapse spaces, drop trailing period
+    s = s.strip().rstrip('.')
+    s = re.sub(r'\s+', ' ', s)
+    return s.casefold()
+
+def dedupe_and_renumber_footnotes(md: str) -> str:
+    # Find "### Sources" heading
+    HEADING_PATTERN = re.compile(r'(?im)^\s*#{1,6}\s*Sources\s*$', re.M)
+    DEF_PATTERN = re.compile(r'(?im)^\s*\[\^(\d+)\]:\s*(.+?)\s*$', re.M)
+    REF_PATTERN = re.compile(r'\[\^(\d+)\]')
+    h = HEADING_PATTERN.search(md)
+    if not h:
+        return md  # nothing to do
+
+    # Split body / sources (everything after the heading line is considered sources block)
+    heading_line_end = md.find('\n', h.end())
+    if heading_line_end == -1:
+        body, sources_block = md[:h.start()], ''
+    else:
+        body, sources_block = md[:h.start()], md[heading_line_end + 1 :]
+
+    # Parse definitions: old_num -> original_title
+    defs: Dict[int, str] = {int(n): t.strip() for n, t in DEF_PATTERN.findall(sources_block)}
+    if not defs:
+        return md  # no definitions found
+
+    # Map normalized title -> first-seen original title (stable representative)
+    title_by_norm: Dict[str, str] = {}
+    for old_num in sorted(defs):
+        t = defs[old_num]
+        n = _normalize_title(t)
+        if n not in title_by_norm:
+            title_by_norm[n] = t
+
+    # Assign new numbers in order of first appearance in the BODY
+    norm_to_new: Dict[str, int] = {}
+    counter = 1
+    for m in REF_PATTERN.finditer(body):
+        old = int(m.group(1))
+        if old not in defs:
+            continue  # unknown reference, leave as-is
+        n = _normalize_title(defs[old])
+        if n not in norm_to_new:
+            norm_to_new[n] = counter
+            counter += 1
+
+    # Replace inline references with new indices (only if known & used)
+    def _replace_ref(m: re.Match) -> str:
+        old = int(m.group(1))
+        if old not in defs:
+            return m.group(0)  # unknown: keep
+        n = _normalize_title(defs[old])
+        new_idx = norm_to_new.get(n)
+        return f'[^{new_idx}]' if new_idx else m.group(0)
+
+    new_body = REF_PATTERN.sub(_replace_ref, body).rstrip()
+
+    # Rebuild de-duplicated Sources list in new order
+    if norm_to_new:
+        max_new = max(norm_to_new.values())
+        new_defs = []
+        # inverse map: index -> normalized title
+        idx_to_norm = {v: k for k, v in norm_to_new.items()}
+        for i in range(1, max_new + 1):
+            n = idx_to_norm.get(i)
+            if n is None:
+                continue
+            title = title_by_norm.get(n, '')
+            new_defs.append(f'[^{i}]: {title}')
+        new_sources = '### Sources\n\n' + '\n'.join(new_defs) + '\n'
+    else:
+        # No known refs used in body → keep an empty Sources heading
+        new_sources = '### Sources\n'
+
+    return new_body + '\n\n' + new_sources
+
+def format_citations(text: str) -> str:
+    """
+    Formats citations in the text to use Markdown-style footnotes.
+    
+    Args:
+        text (str): The input text containing citations.
+        
+    Returns:
+        str: The formatted text with citations as footnotes.
+    """
+    supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    out, footnote_map = md_cite_sc_ids(text)
+    ref_data = supabase.table("ref_info").select("sc_id, doc_title, page_start, page_end").in_("sc_id", list(footnote_map.keys())).execute().data
+    logger.info(f"Processing citations for {len(footnote_map)} unique sc_ids: {list(footnote_map.keys())}. Found {len(ref_data)} matching references in Supabase.")
+    for each in ref_data:
+        # out = out.replace(each['sc_id'], f"{each['doc_title'].title()} p{each['page_start']}{'-'+str(each['page_end']) if each['page_start'] != each['page_end'] else ''}")
+        out = out.replace(each['sc_id'], f"{each['doc_title'].title()}")
+    out = dedupe_and_renumber_footnotes(out)
+    return out

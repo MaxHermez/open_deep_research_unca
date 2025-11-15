@@ -1,5 +1,5 @@
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, get_buffer_string, filter_messages
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, get_buffer_string, filter_messages, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, END, StateGraph
 from langgraph.types import Command
@@ -27,7 +27,12 @@ from open_deep_research.prompts import (
     compress_research_simple_human_message,
     final_report_generation_prompt,
     final_report_rewriting_prompt,
-    lead_researcher_prompt
+    lead_researcher_prompt,
+    select_best_draft_prompt,
+    final_report_rewriting_qualitative_prompt,
+    editor_system,
+    editor_developer,
+    editor_user
 )
 from open_deep_research.utils import (
     get_today_str,
@@ -38,12 +43,15 @@ from open_deep_research.utils import (
     anthropic_websearch_called,
     remove_up_to_last_ai_message,
     get_api_key_for_model,
-    get_notes_from_tool_calls
+    get_notes_from_tool_calls,
+    format_citations
 )
+from open_deep_research.text_tools import text_tools
+import os
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key"),
+    configurable_fields=("model", "max_tokens", "api_key", "reasoning"),
 )
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
@@ -78,17 +86,28 @@ async def write_research_brief(state: AgentState, config: RunnableConfig)-> Comm
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     ))])
+    
+    # Build supervisor messages starting with system message
+    supervisor_messages = [
+        SystemMessage(content=lead_researcher_prompt.format(
+            date=get_today_str(),
+            max_concurrent_research_units=configurable.max_concurrent_research_units
+        ))
+    ]
+    
+    # Add draft template content as AI message if selected
+    draft_template_content = configurable.get_draft_template_content()
+    if draft_template_content:
+        supervisor_messages.append(AIMessage(content=f"I will use this draft template as context for the research:\n\n{draft_template_content}"))
+    
+    # Add the research brief as human message
+    supervisor_messages.append(HumanMessage(content=response.research_brief))
+    
     return Command(
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
-            "supervisor_messages": [
-                SystemMessage(content=lead_researcher_prompt.format(
-                    date=get_today_str(),
-                    max_concurrent_research_units=configurable.max_concurrent_research_units
-                )),
-                HumanMessage(content=response.research_brief)
-            ]
+            "supervisor_messages": supervisor_messages
         }
     )
 
@@ -314,61 +333,78 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     }
     
     findings = "\n".join(notes)
-    max_retries = 3
-    current_retry = 0
-    while current_retry <= max_retries:
-        final_report_prompt = final_report_generation_prompt.format(
-            research_brief=state.get("research_brief", ""),
-            findings=findings,
-            date=get_today_str()
-        )
-        try:
-            final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
-            return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
-                **cleared_state
-            }
-        except Exception as e:
-            if is_token_limit_exceeded(e, configurable.final_report_model):
-                if current_retry == 0:
-                    model_token_limit = get_model_token_limit(configurable.final_report_model)
-                    if not model_token_limit:
-                        return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
-                            **cleared_state
-                        }
-                    findings_token_limit = model_token_limit * 4
-                else:
-                    findings_token_limit = int(findings_token_limit * 0.9)
-                print("Reducing the chars to", findings_token_limit)
-                findings = findings[:findings_token_limit]
-                current_retry += 1
-            else:
-                # If not a token limit exceeded error, then we just throw an error.
-                return {
-                    "final_report": f"Error generating final report: {e}",
-                    **cleared_state
-                }
+    # max_retries = 3
+    # current_retry = 0
+    # while current_retry <= max_retries:
+    final_report_prompt = final_report_generation_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        findings=findings,
+        date=get_today_str()
+    )
+    #     try:
+    final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
+        "final_report": final_report.content, 
         "messages": [final_report],
         **cleared_state
     }
+    #     except Exception as e:
+    #         if is_token_limit_exceeded(e, configurable.final_report_model):
+    #             if current_retry == 0:
+    #                 model_token_limit = get_model_token_limit(configurable.final_report_model)
+    #                 if not model_token_limit:
+    #                     return {
+    #                         "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
+    #                         **cleared_state
+    #                     }
+    #                 findings_token_limit = model_token_limit * 4
+    #             else:
+    #                 findings_token_limit = int(findings_token_limit * 0.9)
+    #             findings = findings[:findings_token_limit]
+    #             current_retry += 1
+    #         else:
+    #             # If not a token limit exceeded error, then we just throw an error.
+    #             return {
+    #                 "final_report": f"Error generating final report: {e}",
+    #                 **cleared_state
+    #             }
+    # return {
+    #     "final_report": "Error generating final report: Maximum retries exceeded",
+    #     "messages": [],
+    #     **cleared_state
+    # }
 
 async def final_report_narrative(state: AgentState, config: RunnableConfig):
+    """
+    Generates refined narrative drafts for the final report using the configured model.
+    Retries on token limit errors by progressively reducing the findings text size.
+    """
+    # ------------------------------------------------------------------
+    # 1) Extract notes and prepare cleared state for return
+    # ------------------------------------------------------------------
     notes = state.get("notes", [])
-    cleared_state = {"notes": {"type": "override", "value": []},}
+    cleared_state = {"notes": {"type": "override", "value": []}}
+
+    # ------------------------------------------------------------------
+    # 2) Prepare model configuration from provided `config`
+    # ------------------------------------------------------------------
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = {
         "model": configurable.final_report_model,
         "max_tokens": configurable.final_report_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config),
     }
-    
+
+    # ------------------------------------------------------------------
+    # 3) Assemble findings text and retry settings
+    # ------------------------------------------------------------------
     findings = "\n".join(notes)
     max_retries = 3
     current_retry = 0
+
+    # ------------------------------------------------------------------
+    # 4) Retry loop: handles token limit exceeded errors by trimming text
+    # ------------------------------------------------------------------
     while current_retry <= max_retries:
         final_report_prompt = final_report_rewriting_prompt.format(
             research_brief=state.get("research_brief", ""),
@@ -376,39 +412,159 @@ async def final_report_narrative(state: AgentState, config: RunnableConfig):
             date=get_today_str(),
             last_draft=state.get("final_report", "")
         )
+
         try:
-            final_report = await configurable_model.with_config(writer_model_config).ainvoke([HumanMessage(content=final_report_prompt)])
+            # Send prompt to model; duplicate prompt for multiple draft requests
+            if configurable.qualitative_analysis and configurable.qualitative_analysis.lower() != "none":
+                qa = configurable.get_qualitative_analysis_content()
+                msgs = [[HumanMessage(content=final_report_rewriting_qualitative_prompt.format(
+                    research_brief=state.get("research_brief", ""),
+                    qualitative_analysis=qa,
+                    last_draft=state.get("final_report", "")
+                ))]]
+                msgs *= configurable.narrative_drafts
+                final_reports = await configurable_model.with_config(writer_model_config).abatch(msgs)  # pyright: ignore
+            else:
+                msgs = [[HumanMessage(content=final_report_prompt)]]
+                msgs *= configurable.narrative_drafts
+                final_reports = await configurable_model.with_config(writer_model_config).abatch(msgs)  # pyright: ignore
+
+            # Extract only non-empty draft contents
+            final_reports_contents = [
+                final_report.content for final_report in final_reports if final_report.content
+            ]
+
             return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
+                "refined_drafts": final_reports_contents,
+                "messages": final_reports,
                 **cleared_state
             }
+
         except Exception as e:
+            # ----------------------------------------------------------
+            # Handle token limit exceeded: progressively reduce findings
+            # ----------------------------------------------------------
             if is_token_limit_exceeded(e, configurable.final_report_model):
                 if current_retry == 0:
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
                         return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
+                            "refined_drafts": [
+                                f"Error generating final report: Token limit exceeded, "
+                                f"however, we could not determine the model's maximum context length. "
+                                f"Please update the model map in deep_researcher/utils.py with this information. {e}"
+                            ],
                             **cleared_state
                         }
                     findings_token_limit = model_token_limit * 4
                 else:
                     findings_token_limit = int(findings_token_limit * 0.9)
-                print("Reducing the chars to", findings_token_limit)
+
                 findings = findings[:findings_token_limit]
                 current_retry += 1
+
+            # ----------------------------------------------------------
+            # Other errors: return immediately with error message
+            # ----------------------------------------------------------
             else:
-                # If not a token limit exceeded error, then we just throw an error.
                 return {
-                    "final_report": f"Error generating final report: {e}",
+                    "refined_drafts": [f"Error generating final report: {e}"],
                     **cleared_state
                 }
+
+    # ------------------------------------------------------------------
+    # 5) Retries exhausted: return error message
+    # ------------------------------------------------------------------
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
+        "refined_drafts": ["Error generating final report: Maximum retries exceeded"],
+        "messages": [final_reports],
+        **cleared_state
+    }
+
+
+async def select_best_draft(state: AgentState, config: RunnableConfig):
+    cleared_state = {"refined_drafts": {"type": "override", "value": []},}
+    configurable = Configuration.from_runnable_config(config)
+    writer_model_config = {
+        "model": configurable.best_draft_model,
+        "max_tokens": configurable.best_draft_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.research_model, config),
+    }
+    if "o3" in configurable.best_draft_model:
+        writer_model_config["reasoning"] = {"effort": "high"}
+
+    # while current_retry <= max_retries:
+    drafts = ""
+    for i, draft in enumerate(state.get("refined_drafts", [])):
+        drafts += f"<Draft {i + 1}>\n{draft}\n</Draft {i + 1}>\n\n"
+    drafts = drafts.strip()
+    best_draft_prompt = select_best_draft_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        date=get_today_str(),
+        original_research=state.get("final_report", ""),
+        drafts=drafts,
+        user_request=state.get("messages", [])[0].content if state.get("messages") else "User request not available."
+    )
+        # try:
+    msgs = [HumanMessage(content=best_draft_prompt)]
+    final_report = await configurable_model.with_config(writer_model_config).ainvoke(msgs)
+    final_report_obj = eval(final_report.content[1]['text'].strip().strip("```").strip("json").strip())
+    selected_draft_index = final_report_obj["best_draft"] - 1
+    selected_draft = state.get("refined_drafts", [])[selected_draft_index]
+    return {
+        "final_report": selected_draft,
         "messages": [final_report],
         **cleared_state
     }
+
+
+async def editor_tool(state: AgentState, config: RunnableConfig):
+    tools = {t.name: t for t in text_tools}
+    tool_call_id = state['editor_messages'][-1].tool_calls[0]["id"]
+    tool_name = state['editor_messages'][-1].tool_calls[0]["name"]
+    tool_args = state['editor_messages'][-1].tool_calls[0]["args"]
+    # inject the text into args
+    tool_args['text'] = state['final_report']
+    tool = tools.get(tool_name)
+    # check if we need to inject any args to the tool
+    if tool:
+        response = await tool.ainvoke(tool_args)
+        return {"editor_messages": state['editor_messages'] + [ToolMessage(content=response, tool_call_id=tool_call_id)]}
+    print("OINO")
+    return {"editor_messages": state['editor_messages'] + [HumanMessage(content="Tool not found")]}
+
+
+async def add_to_findings(state: AgentState, config: RunnableConfig):
+    configurable = Configuration.from_runnable_config(config)
+
+    model_config = {
+        "model": configurable.final_report_model,
+        "max_tokens": configurable.final_report_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.research_model, config),
+    }
+    model = configurable_model.with_config(model_config)
+
+    tools_model = model.bind_tools(text_tools)
+
+    if configurable.qualitative_analysis and configurable.qualitative_analysis.lower() != "none":
+        qa = configurable.get_qualitative_analysis_content()
+        if len(state['editor_messages']) == 0:
+            dev_message = SystemMessage(content=editor_developer)
+            dev_message.additional_kwargs = {"__openai_role__": "developer"}
+            msgs = [SystemMessage(content=editor_system), dev_message, AIMessage(content=state['final_report']), HumanMessage(content=editor_user.format(fault_tree_text=qa))]
+        else:
+            msgs = [HumanMessage(content=editor_user.format(fault_tree_text=qa))]
+        response = await tools_model.ainvoke(state['editor_messages'] + msgs)
+    return {"editor_messages": msgs + [response]}
+
+async def format_citations_node(state: AgentState, config: RunnableConfig):
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.format_citations:
+        return state
+
+    formatted_citations = format_citations(state.get("final_report", ""))
+    return {"final_narrative": formatted_citations}
+
 
 deep_researcher_builder = StateGraph(AgentState, input=AgentInputState, config_schema=Configuration)
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)
@@ -416,9 +572,30 @@ deep_researcher_builder.add_node("write_research_brief", write_research_brief)
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)
 deep_researcher_builder.add_node("final_report_narrative", final_report_narrative)
+deep_researcher_builder.add_node("select_best_draft", select_best_draft)
+deep_researcher_builder.add_node("format_citations", format_citations_node)
+# deep_researcher_builder.add_node("editor_tool", editor_tool)
+# deep_researcher_builder.add_node("add_to_findings", add_to_findings)
+
 deep_researcher_builder.add_edge(START, "clarify_with_user")
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation")
 deep_researcher_builder.add_edge("final_report_generation", "final_report_narrative")
-deep_researcher_builder.add_edge("final_report_narrative", END)
+# add a conditional edge from final_report_narrative to select_best_draft if configurable.narrative_drafts > 1
+deep_researcher_builder.add_conditional_edges(
+    "final_report_narrative",
+    lambda state, config: "select_best_draft" if Configuration.from_runnable_config(config).narrative_drafts > 1 else "format_citations",
+    ["select_best_draft", "format_citations"]
+)
+
+# deep_researcher_builder.add_edge("select_best_draft", "add_to_findings")
+# deep_researcher_builder.add_conditional_edges(
+#     "add_to_findings",
+#     lambda state, config: "editor_tool" if state.get("editor_messages") and isinstance(state.get("editor_messages")[-1], AIMessage) and state.get("editor_messages")[-1].tool_calls else "format_citations",
+#     ["format_citations", "editor_tool"]
+# )
+
+# deep_researcher_builder.add_edge("editor_tool", "add_to_findings")
+deep_researcher_builder.add_edge("select_best_draft", "format_citations")
+deep_researcher_builder.add_edge("format_citations", END)
 
 deep_researcher = deep_researcher_builder.compile()

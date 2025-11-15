@@ -3,6 +3,41 @@ from typing import Any, List, Optional
 from langchain_core.runnables import RunnableConfig
 import os
 from enum import Enum
+from pathlib import Path
+
+def _get_dir_options(dirname: str):
+    """Get available draft options from the drafts folder."""
+    try:
+        # Get the current file's directory and navigate to the drafts folder
+        current_dir = Path(__file__).parent
+        drafts_dir = current_dir / dirname
+        
+        if not drafts_dir.exists():
+            return [{"label": "None", "value": "none"}]
+        
+        # Get all .md files in the drafts directory
+        draft_files = list(drafts_dir.glob("*.md"))
+        
+        if not draft_files:
+            return [{"label": "None", "value": "none"}]
+        
+        # Create options list with file names without .md extension
+        options = [{"label": "None", "value": "none"}]  # Default option
+        for file_path in draft_files:
+            file_name = file_path.stem  # Gets filename without extension
+            options.append({"label": file_name, "value": file_name.lower().replace(" ", "_")})
+        print(f"Draft options: {options}")  # Debugging output
+        return options
+    except Exception:
+        return [{"label": "None", "value": "none"}]
+
+def get_draft_options():
+    """Get available draft options."""
+    return _get_dir_options("drafts")
+
+def get_qual_analysis_options():
+    """Get available qualitative analysis options."""
+    return _get_dir_options("fault_trees")
 
 class SearchAPI(Enum):
     ANTHROPIC = "anthropic"
@@ -27,6 +62,38 @@ class MCPConfig(BaseModel):
         optional=True,
     )
     """Whether the MCP server requires authentication"""
+
+# class GoogleDocsConfig(BaseModel):
+#     output_to_google_docs: bool = Field(
+#         default=False,
+#         metadata={
+#             "x_oap_ui_config": {
+#                 "type": "boolean",
+#                 "default": False,
+#                 "description": "Whether to output the final report to Google Docs. If enabled, the final report will be saved to Google Drive."
+#             }
+#         }
+#     )
+#     drive_output_directory: str = Field(
+#         default="odr_output",
+#         metadata={
+#             "x_oap_ui_config": {
+#                 "type": "text",
+#                 "default": "odr_output",
+#                 "description": "The name of the output directory in Google Drive where research results will be stored."
+#             }
+#         }
+#     )
+#     output_file_name: str = Field(
+#         default="research_results",
+#         metadata={
+#             "x_oap_ui_config": {
+#                 "type": "text",
+#                 "default": "research_results",
+#                 "description": "The base name of the output file in Google Drive. The file will be saved as <output_file_name>_<timestamp>.txt."
+#             }
+#         }
+#     )
 
 class Configuration(BaseModel):
     # General Configuration
@@ -67,11 +134,11 @@ class Configuration(BaseModel):
     )
     # Research Configuration
     search_api: SearchAPI = Field(
-        default=SearchAPI.TAVILY,
+        default=SearchAPI.SUPABASE,
         metadata={
             "x_oap_ui_config": {
                 "type": "select",
-                "default": "tavily",
+                "default": "supabase",
                 "description": "Search API to use for research. NOTE: Make sure your Researcher Model supports the selected search API.",
                 "options": [
                     {"label": "Tavily", "value": SearchAPI.TAVILY.value},
@@ -111,21 +178,21 @@ class Configuration(BaseModel):
     )
     # Model Configuration
     summarization_model: str = Field(
-        default="openai:gpt-4.1-nano",
+        default="openai:gpt-4.1",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openai:gpt-4.1-nano",
+                "default": "openai:gpt-4.1",
                 "description": "Model for summarizing research results from Tavily search results"
             }
         }
     )
     summarization_model_max_tokens: int = Field(
-        default=8192,
+        default=15000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 8192,
+                "default": 15000,
                 "description": "Maximum output tokens for summarization model"
             }
         }
@@ -141,31 +208,31 @@ class Configuration(BaseModel):
         }
     )
     research_model_max_tokens: int = Field(
-        default=10000,
+        default=32768,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
+                "default": 32768,
                 "description": "Maximum output tokens for research model"
             }
         }
     )
     compression_model: str = Field(
-        default="openai:gpt-4.1-mini",
+        default="openai:gpt-4.1",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openai:gpt-4.1-mini",
+                "default": "openai:gpt-4.1",
                 "description": "Model for compressing research findings from sub-agents. NOTE: Make sure your Compression Model supports the selected search API."
             }
         }
     )
     compression_model_max_tokens: int = Field(
-        default=8192,
+        default=15000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 8192,
+                "default": 15000,
                 "description": "Maximum output tokens for compression model"
             }
         }
@@ -181,15 +248,94 @@ class Configuration(BaseModel):
         }
     )
     final_report_model_max_tokens: int = Field(
+        default=32768,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 32768,
+                "description": "Maximum output tokens for final report model"
+            }
+        }
+    )
+    best_draft_model: str = Field(
+        default="openai:o3-mini",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "openai:o3-mini",
+                "description": "Model for selecting the best draft from multiple narrative drafts"
+            }
+        }
+    )
+    best_draft_model_max_tokens: int = Field(
         default=10000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
                 "default": 10000,
-                "description": "Maximum output tokens for final report model"
+                "description": "Maximum output tokens for best draft model"
             }
         }
     )
+    format_citations: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to format citations in the final report . If enabled, the final report will include citations in the format [sc_id]."
+            }
+        }
+    )
+
+    draft_template: Optional[str] = Field(
+        default="none",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "none",
+                "description": "Select a draft template to prepend to the research brief. This will include the template content as context before conducting research.",
+                "options": get_draft_options()
+            }
+        }
+    )
+
+    qualitative_analysis: Optional[str] = Field(
+        default="none",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "none",
+                "description": "Select a qualitative analysis method to apply to the research findings.",
+                "options": get_qual_analysis_options()
+            }
+        }
+    )
+
+    narrative_drafts: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 3,
+                "min": 0,
+                "max": 10,
+                "step": 1,
+                "description": "Number of narrative drafts to generate for the final report. The final report will be a combination of these drafts."
+            }
+        }
+    )
+    # google_docs_output_config: Optional[GoogleDocsConfig] = Field(
+    #     default=None,
+    #     optional=True,
+    #     metadata={
+    #         "x_oap_ui_config": {
+    #             "type": "google_docs",
+    #             "description": "Google Docs output configuration. If provided, the final report will be saved to Google Drive."
+    #         }
+    #     }
+    # )
+
     # MCP server configuration
     mcp_config: Optional[MCPConfig] = Field(
         default=None,
@@ -225,6 +371,50 @@ class Configuration(BaseModel):
             for field_name in field_names
         }
         return cls(**{k: v for k, v in values.items() if v is not None})
+
+    def get_draft_template_content(self) -> Optional[str]:
+        """Get the content of the selected draft template (case/underscore-insensitive)."""
+        if not self.draft_template or str(self.draft_template).lower() == "none":
+            return None
+
+        def norm(s: str) -> str:
+            # Normalize by treating underscores and spaces equivalently and ignoring case
+            return " ".join(str(s).replace("_", " ").lower().split())
+
+        try:
+            current_dir = Path(__file__).parent
+            drafts_dir = current_dir / "drafts"
+            target = norm(self.draft_template)
+
+            for file_path in drafts_dir.glob("*.md"):
+                if norm(file_path.stem) == target:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        return f.read()
+            return None
+        except Exception:
+            return None
+
+    def get_qualitative_analysis_content(self) -> Optional[str]:
+        """Get the content of the selected qualitative analysis method (case/underscore-insensitive)."""
+        if not self.qualitative_analysis or str(self.qualitative_analysis).lower() == "none":
+            return None
+
+        def norm(s: str) -> str:
+            # Normalize by treating underscores and spaces equivalently and ignoring case
+            return " ".join(str(s).replace("_", " ").lower().split())
+
+        try:
+            current_dir = Path(__file__).parent
+            fault_trees_dir = current_dir / "fault_trees"
+            target = norm(self.qualitative_analysis)
+
+            for file_path in fault_trees_dir.glob("*.md"):
+                if norm(file_path.stem) == target:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        return f.read()
+            return None
+        except Exception:
+            return None
 
     class Config:
         arbitrary_types_allowed = True

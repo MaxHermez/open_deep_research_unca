@@ -90,6 +90,7 @@ When you are completely satisfied with the research findings returned from the t
 5. If there are important and specific gaps in the research findings, you can then call the "ConductResearch" tool again to conduct research on the specific gap.
 6. Iteratively call the "ConductResearch" tool until you are satisfied with the research findings, then call the "ResearchComplete" tool to indicate that you are done with your research.
 7. Don't call "ConductResearch" to synthesize any information you've gathered. Another agent will do that after you call "ResearchComplete". You should only call "ConductResearch" to research net new topics and get net new information.
+8. Follow leads to trace down primary sources, statistics, and data points after you gather information. Assess whether the information you have is supported by data and statistics, and if not, call "ConductResearch" with smaller, more specific topics focused on finding the data and statistics that support the information you have.
 </Instructions>
 
 
@@ -109,11 +110,11 @@ When you are completely satisfied with the research findings returned from the t
 - If you are not confident in how you can parallelize research, you can call the "ConductResearch" tool a single time on a more general topic in order to gather more background information, so you have more context later to reason about if it's necessary to parallelize research.
 - Each parallel "ConductResearch" linearly scales cost. The benefit of parallel research is that it can save the user time, but carefully think about whether the additional cost is worth the benefit. 
 - For example, if you could search three clear topics in parallel, or break them each into two more subtopics to do six total in parallel, you should think about whether splitting into smaller subtopics is worth the cost. The researchers are quite comprehensive, so it's possible that you could get the same information with less cost by only calling the "ConductResearch" tool three times in this case.
-- Also consider where there might be dependencies that cannot be parallelized. For example, if asked for details about some entities, you first need to find the entities before you can research them in detail in parallel.
+- Also consider where there might be dependencies that cannot be parallelized. For example, **if asked for details about some entities, you first need to find the entities before you can research them in detail in parallel**.
 
 **Different questions require different levels of research depth**
-- If a user is asking a broader question, your research can be more shallow, and you may not need to iterate and call the "ConductResearch" tool as many times.
-- If a user uses terms like "detailed" or "comprehensive" in their question, you may need to be more stingy about the depth of your findings, and you may need to iterate and call the "ConductResearch" tool more times to get a fully detailed answer.
+- Some topics within the user's request may be less complex, more broad, and not need to iterate and call the "ConductResearch" tool as many times.
+- In more core topic questions and decisive points, you may need to be more stingy about the depth of your findings, and you may need to iterate and call the "ConductResearch" tool more times to get to a fully detailed answer.
 
 **Research is expensive**
 - Research is expensive, both from a monetary and time perspective.
@@ -122,6 +123,7 @@ When you are completely satisfied with the research findings returned from the t
 - You should only ask for topics that are ABSOLUTELY necessary to research for a comprehensive answer.
 - Before you ask about a topic, be sure that it is substantially different from any topics that you have already researched. It needs to be substantially different, not just rephrased or slightly different. The researchers are quite comprehensive, so they will not miss anything.
 - When you call the "ConductResearch" tool, make sure to explicitly state how much effort you want the sub-agent to put into the research. For background research, you may want it to be a shallow or small effort. For critical topics, you may want it to be a deep or large effort. Make the effort level explicit to the researcher.
+- Taking all of this into consideration, you should still conduct at least five rounds of research, with at least one of them being a broad search to get background information, and gradually narrowing down to more specific topics.
 </Important Guidelines>
 
 
@@ -217,6 +219,7 @@ Critical Reminder: It is extremely important that any information that is even r
 
 compress_research_simple_human_message = """All above messages are about research conducted by an AI Researcher. Please clean up these findings.
 
+You must maintain the integrity of the sc_id values, copying them letter for letter. Even one small mistake can cause issues with citation tracking.
 DO NOT summarize the information. I want the raw information returned, just in a cleaner format. Make sure all relevant information is preserved - you can rewrite findings verbatim."""
 
 final_report_generation_prompt = """Based on all the research conducted, create a comprehensive, well-structured answer to the overall research brief:
@@ -233,16 +236,15 @@ Here are the findings from the research that you conducted:
 
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
-2. Includes specific facts and insights from the research
-3. References relevant sources using [Title](URL) format
-4. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
-5. Includes a "Sources" section at the end with all referenced links
+2. Is well sourced by including specific facts and insights from the research and referencing every fact with a citation number in the text
+3. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
+4. Includes a "Sources" section at the end with all referenced links
 
-You can structure your report in a number of different ways. Here's an example structure for your report:
+Here's an example structure for your report, but feel free to adapt it as necessary:
 
-1/ Introduction: Briefly introduce the selected national development challenge/opportunity.
+1/ Introduction: Briefly introduce the selected research topic.
 2/ Current State: Present the current situation, supporting it with at least one data point or statistic (with proper references).
-3/ Implications: Analyze the implications for Albania's development, referencing relevant SDGs and affected LNOB groups.
+3/ Implications: Analyze the implications for KSA's development, referencing relevant SDGs and affected LNOB groups.
 4/ Strategies: Outline potential strategies for addressing the challenge/opportunity, noting alignments with the six global transitions and circular-economy interventions where relevant.
 5/ Conclusion: Summarize key findings and recommendations.
 
@@ -254,6 +256,7 @@ For each section of the report, do the following:
 - Use ## for section title (Markdown format) for each section of the report. But try to limit the number of sections to 4 very long and thorough sections at most. This is to try to keep the report as cohesive narrative instead of a list of facts.
 - Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language.
 - Do not say what you are doing in the report. Just write the report without any commentary from yourself.
+- Try to avoid grouping citations at the end of paragraphs or sections, and instead place them at the citation point in the text.
 
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
@@ -276,6 +279,7 @@ final_report_rewriting_prompt = """Based on the existing draft, create an edited
 </Research Brief>
 
 Here is the last draft of the research report:
+
 <Last Draft>
 {last_draft}
 </Last Draft>
@@ -290,6 +294,52 @@ For each section of the report, do the following:
 - Use simple, clear language
 - Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language.
 - Do not say what you are doing in the report. Just write the report without any commentary from yourself.
+- Maintain the citations next to the same data points as in the Last Draft. DO NOT bunch up citations at the end of paragraphs or sections. Keep the citations in the same contextual position as they were in the Last Draft.
+
+Format the report in clear markdown with proper structure and include source references where the Last Draft includes them.
+
+<Citation Rules>
+- Assign each unique ID a single citation number in your text
+- End with ### Sources that lists each source with corresponding numbers
+- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
+- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
+- Do not bunche many claims under long citation strings (e.g., “[1][2][3][4][5][6]”). Keep keep the citation and claims or data points pairing exactly as it is in the Last Draft.
+- Example format:
+  [1] ID: sc_1234567890
+  [2] ID: sc_0987654321
+- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
+</Citation Rules>
+
+**REMEMBER**
+Try to keep each citation next its intended data point, not at the end of each paragrpah. The [X] numbered citations should be in the same contextual position as it was in the Last Draft."""
+
+final_report_rewriting_qualitative_prompt = """Based on the existing draft (Last Draft) as well my Qualitative Analysis, create an edited narrative-format version to the overall draft, which was written for the following Research Brief:
+
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+<Qualitative Analysis>
+{qualitative_analysis}
+</Qualitative Analysis>
+
+Here is the last draft of the research report:
+<Last Draft>
+{last_draft}
+</Last Draft>
+
+Please create an edited version from the last draft that:
+1. In narrative format. Think like a journalist writing a story, not a structured and sectioned report (as is the draft)
+2. Includes all the same specific facts, insights, points, and citations from the research. Your job is not to come up with new ideas and points, but to create the same report in a different format.
+3. References relevant sources in the exact same format as the Last Draft.
+4. Includes the "Sources" section at the end with all referenced links
+5. Treat the qualitative analysis as just another section of the Last Draft, without any special treatment except that it's allowed to not have citations.
+
+For each section of the report, do the following:
+- Use simple, clear language
+- Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language.
+- Do not say what you are doing in the report. Just write the report without any commentary from yourself.
+- Maintain the citations next to the same data points as in the Last Draft. DO NOT bunch up citations at the end of paragraphs or sections. Keep the citations in the same contextual position as they were in the Last Draft.
 
 Format the report in clear markdown with proper structure and include source references where the Last Draft includes them.
 
@@ -415,3 +465,98 @@ Special-case hints
 
 Today's date is {date}.
 """
+
+select_best_draft_prompt = """
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+<Source>
+{original_research}
+</Source>
+
+<Drafts>
+{drafts}
+</Drafts>
+
+Original user request:
+<Original Request>
+{user_request}
+</Original Request>
+
+Today's date is {date}.
+
+The Research Brief is a generated from the Original Request, and the Source is the resulting research that was conducted. The Drafts are different drafts of the report that were generated based on the Source and Research Brief.
+
+Please select the best draft out of those three. And point out any citation inconsistencies.
+
+Respond in the following format without any additional text:
+
+```json
+{{
+    "best_draft": int,
+    "reasoning": "a short explanation of why you chose the selected draft",
+    "referencing_inconsistencies": ["This list could be empty"]
+}}
+```
+"""
+
+
+editor_system = """You are a **post-processor** that edits an already-written UN Country Analysis (CA) report section.  
+Your sole task: **integrate colleagues’ fault-tree insights into each CA narrative** without altering meaning elsewhere.
+
+## Objectives
+
+1. **Seamless integration:** Insert a short, cohesive paragraph that distills the fault-tree insights in the **same tone and register** as the document.
+2. **Stability:** Do **not** introduce new claims beyond the provided fault-tree input or the existing report. Do not re-structure the doc. Make only minimal copyedits needed for flow.
+3. **Safety:** No hallucinations. If the fault-tree input conflicts with the report, favor the report.
+
+## Editing Policy
+
+- Touch only: (a) the added paragraph/merged causal paragraph, (b) micro-edits for transitions/punctuation.
+- Keep headings, titles, numbering, endnotes, and indicator tables intact.
+- Unique endnote numbering per document must remain stable.
+
+## Transition Examples (pick one or adapt a new one)
+
+- “**Root-cause analysis indicates** …”
+- “**Fault-tree review across agencies highlights** …”
+- “**Synthesizing the qualitative fault-tree inputs, the most proximal drivers are** …”
+- “**Taken together, the causal pathways converge on** …, **which interact with** … to sustain the CA.”
+
+## Self-Check Before Save
+
+-  Paragraph reads like the rest of the document (tone/terminology).
+-  Placed at its intended location within the text.
+-  No contradictions or speculative claims.
+-  Document structure and numbering unchanged.
+
+You have access to a set of tools and you are expected to . Use them deterministically and describe each change in the tool log."""
+
+editor_developer = """**Workflow you must follow:**
+
+1. `open(report_path)` and read the current Country Analysis (CA) section.
+2. Detect anchors in priority order:  
+    a) A paragraph starting with “Causes”, “Causal narrative”, or similar.  
+    b) The last paragraph **before** “Indicators”, “Endnotes/References”, or the next `H1/H2` CA header.
+3. Build the integrated paragraph from `fault_tree_text` (summarize, compress, and de-duplicate with existing narrative).
+4. **If (a) exists:** rewrite that single paragraph to merge fault-tree content (do not create a new heading).  
+    **Else:** `insert_after` the chosen anchor with the integrated paragraph.
+5. Citations:
+    - If `endnote_map` exists, reuse IDs exactly.
+    - Else, add **in-text generic attribution** only (no new IDs).
+6. Once you're fully done and verified all your changes, respond with "DONE" without anything else.
+
+**Hard constraints:** no global reflow, no renumbering, no section title edits, no new footnotes."""
+
+editor_user = """Task: Integrate colleagues’ fault-tree insights into the Country Analysis (CA) narrative.
+
+Fault-tree text (verbatim): <<FT_START>>
+{fault_tree_text}
+<<FT_END>>
+
+Anchors to respect (if present): ["Indicators", "Endnotes", "References"]
+
+Notes:
+- Institutional tone; match existing diction.
+- If contradictions detected, prefer report."""
