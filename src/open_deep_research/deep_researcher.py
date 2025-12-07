@@ -24,8 +24,10 @@ from open_deep_research.prompts import (
     compress_research_simple_human_message,
     compress_research_system_prompt,
     final_report_generation_prompt,
+    final_report_rewriting_prompt,
     lead_researcher_prompt,
     research_system_prompt,
+    select_best_draft_prompt,
     transform_messages_into_research_topic_prompt,
 )
 from open_deep_research.state import (
@@ -33,6 +35,7 @@ from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
     ConductResearch,
+    DraftSelection,
     ResearchComplete,
     ResearcherOutputState,
     ResearcherState,
@@ -46,6 +49,8 @@ from open_deep_research.utils import (
     get_model_token_limit,
     get_notes_from_tool_calls,
     get_today_str,
+    format_citations,
+    init_chat_model_with_gpt5_support,
     is_token_limit_exceeded,
     openai_websearch_called,
     remove_up_to_last_ai_message,
@@ -54,8 +59,12 @@ from open_deep_research.utils import (
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key"),
+    configurable_fields=("model", "max_tokens", "api_key", "timeout"),
 )
+# configurable_model = configurable_model.bind(timeout=600)
+# configurable_model = init_chat_model_with_gpt5_support(
+#     configurable_fields=("model", "max_tokens", "api_key"),
+# )
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
@@ -625,9 +634,12 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = {
-        "model": configurable.final_report_model,
-        "max_tokens": configurable.final_report_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "configurable": {
+            "model": configurable.final_report_model,
+            "max_tokens": configurable.final_report_model_max_tokens,
+            "api_key": get_api_key_for_model(configurable.final_report_model, config),
+            "timeout": 600.0,
+        },
         "tags": ["langsmith:nostream"]
     }
     
@@ -641,7 +653,6 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             # Create comprehensive prompt with all research context
             final_report_prompt = final_report_generation_prompt.format(
                 research_brief=state.get("research_brief", ""),
-                messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
                 date=get_today_str()
             )
@@ -696,6 +707,184 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         **cleared_state
     }
 
+async def final_report_narrative(state: AgentState, config: RunnableConfig):
+    """Generate refined narrative drafts for the final report with retry logic.
+    
+    This function takes the initial report and creates multiple narrative drafts
+    to improve readability, structure, and overall quality. It uses retry logic
+    to handle token limit errors by progressively reducing the findings text size.
+    
+    Args:
+        state: Agent state containing research findings and initial report
+        config: Runtime configuration with model settings and API keys
+        
+    Returns:
+        Dictionary containing refined drafts and cleared state
+    """
+    # Step 1: Extract notes and prepare cleared state for return
+    notes = state.get("notes", [])
+    cleared_state = {"notes": {"type": "override", "value": []}}
+    
+    # Step 2: Configure the narrative model
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Check if narrative drafts are enabled (narrative_drafts > 0)
+    if configurable.narrative_drafts == 0:
+        # Skip narrative refinement, just return current report
+        return {
+            "final_report": state.get("final_report", ""),
+            **cleared_state
+        }
+    
+    writer_model_config = {
+        "model": configurable.final_report_model,
+        "max_tokens": configurable.final_report_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "tags": ["langsmith:nostream"]
+    }
+    
+    # Step 3: Prepare findings and retry settings
+    findings = "\n".join(notes)
+    max_retries = 3
+    current_retry = 0
+    findings_token_limit: int | None = None
+    
+    # Step 4: Retry loop for handling token limit exceeded errors
+    while current_retry <= max_retries:
+        try:
+            # Create narrative refinement prompt
+            
+            final_report_prompt = final_report_rewriting_prompt.format(
+                research_brief=state.get("research_brief", ""),
+                findings=findings,
+                date=get_today_str(),
+                last_draft=state.get("final_report", "")
+            )
+            
+            # Generate multiple narrative drafts in parallel
+            msgs: list = [[HumanMessage(content=final_report_prompt)]] * configurable.narrative_drafts
+            final_reports = await configurable_model.with_config(writer_model_config).abatch(msgs)  # pyright: ignore
+            
+            # Extract non-empty draft contents
+            final_reports_contents = [
+                final_report.content for final_report in final_reports 
+                if final_report.content
+            ]
+            
+            # Select the best draft if multiple were generated
+            if len(final_reports_contents) > 1:
+                # Use the best_draft_model to select the best narrative
+                best_draft_config = {
+                    "model": configurable.best_draft_model,
+                    "max_tokens": configurable.best_draft_model_max_tokens,
+                    "api_key": get_api_key_for_model(configurable.best_draft_model, config),
+                    "tags": ["langsmith:nostream"]
+                }
+                
+                # Prepare drafts for the prompt
+                drafts_text = ""
+                for idx, draft in enumerate(final_reports_contents, 1):
+                    drafts_text += f"\n--- Draft {idx} ---\n{draft}\n"
+                
+                # Create selection prompt with proper format
+                selection_prompt = select_best_draft_prompt.format(
+                    research_brief=state.get("research_brief", ""),
+                    original_research="\n".join(notes),
+                    drafts=drafts_text,
+                    user_request=get_buffer_string(state.get("messages", [])),
+                    date=get_today_str()
+                )
+                
+                # Get structured selection response
+                selection_model = (
+                    configurable_model
+                    .with_structured_output(DraftSelection)
+                    .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+                    .with_config(best_draft_config)  # pyright: ignore
+                )
+                
+                selection_response = await selection_model.ainvoke([HumanMessage(content=selection_prompt)])
+                
+                # Get the best draft based on the selection
+                try:
+                    selected_idx = selection_response.best_draft - 1  # Convert from 1-indexed to 0-indexed
+                    if 0 <= selected_idx < len(final_reports_contents):
+                        best_draft = final_reports_contents[selected_idx]
+                    else:
+                        best_draft = final_reports_contents[0]
+                except (ValueError, IndexError, AttributeError):
+                    best_draft = final_reports_contents[0]
+            else:
+                best_draft = final_reports_contents[0] if final_reports_contents else state.get("final_report", "")
+            return {
+                "final_report": best_draft,
+                "messages": [AIMessage(content=best_draft)],
+                **cleared_state
+            }
+            
+        except Exception as e:
+            # Handle token limit exceeded errors with progressive truncation
+            if is_token_limit_exceeded(e, configurable.final_report_model):
+                current_retry += 1
+                
+                if current_retry == 1:
+                    # First retry: determine initial truncation limit
+                    model_token_limit = get_model_token_limit(configurable.final_report_model)
+                    if not model_token_limit:
+                        return {
+                            "final_report": f"Error generating narrative report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in utils.py with this information. {e}",
+                            "messages": [AIMessage(content="Narrative generation failed due to token limits")],
+                            **cleared_state
+                        }
+                    # Use 4x token limit as character approximation for truncation
+                    findings_token_limit = model_token_limit * 4
+                else:
+                    # Subsequent retries: reduce by 10% each time
+                    findings_token_limit = int(findings_token_limit * 0.9) if findings_token_limit else None
+                
+                # Truncate findings and retry
+                findings = findings[:findings_token_limit]
+                continue
+            else:
+                # Non-token-limit error: return error immediately
+                return {
+                    "final_report": f"Error generating narrative report: {e}",
+                    "messages": [AIMessage(content="Narrative generation failed due to an error")],
+                    **cleared_state
+                }
+    
+    # Step 5: Return failure result if all retries exhausted
+    return {
+        "final_report": "Error generating narrative report: Maximum retries exceeded",
+        "messages": [AIMessage(content="Narrative generation failed after maximum retries")],
+        **cleared_state
+    }
+
+async def format_citations_node(state: AgentState, config: RunnableConfig):
+    """Format citations in the final report according to specified style.
+    
+    This function takes the final report and formats any citations present
+    according to the citation style defined in the configuration.
+    
+    Args:
+        state: Agent state containing the final report
+        config: Runtime configuration with citation style settings
+        
+    Returns:
+        Dictionary containing the formatted final report
+    """
+    # Step 1: Extract final report and citation style
+    final_report = state.get("final_report", "")
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Step 2: Format citations using the format_citations utility
+    formatted_report = await format_citations(final_report)
+    
+    # Step 3: Return updated final report with formatted citations
+    return {
+        "final_report": formatted_report
+    }    
+
 # Main Deep Researcher Graph Construction
 # Creates the complete deep research workflow from user input to final report
 deep_researcher_builder = StateGraph(
@@ -709,11 +898,16 @@ deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)        
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # Research planning phase
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # Report generation phase
+deep_researcher_builder.add_node("final_report_narrative", final_report_narrative)  # Narrative refinement phase
+# deep_researcher_builder.add_node("format_citations", format_citations_node)         # Citation formatting phase
 
 # Define main workflow edges for sequential execution
 deep_researcher_builder.add_edge(START, "clarify_with_user")                       # Entry point
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # Research to report
-deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
+deep_researcher_builder.add_edge("final_report_generation", "final_report_narrative") # Report to narrative
+deep_researcher_builder.add_edge("final_report_narrative", END)         # Narrative to citation formatting
+# deep_researcher_builder.add_edge("final_report_narrative", "format_citations")         # Narrative to citation formatting
+# deep_researcher_builder.add_edge("format_citations", END)                    # Final exit point
 
 # Compile the complete deep researcher workflow
 deep_researcher = deep_researcher_builder.compile()

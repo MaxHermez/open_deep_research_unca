@@ -21,11 +21,33 @@ class ConductResearch(BaseModel):
 class ResearchComplete(BaseModel):
     """Call this tool to indicate that the research is complete."""
 
+class Excerpt(BaseModel):
+    """A key excerpt from research results."""
+    
+    sc_id: str = Field(
+        description="The source ID (sc_xxxx) for this excerpt"
+    )
+    excerpt: str = Field(
+        description="The extracted quote, sentence, or data point"
+    )
+
 class Summary(BaseModel):
-    """Research summary with key findings."""
+    """Research summary with key findings from web pages."""
+    
+    sc_id: str = Field(
+        description="A unique identifier for the excerpt.",
+    )
+    excerpt: str = Field(
+        description="The text of the excerpt.",
+    )
+class SupabaseSummary(BaseModel):
+    """Research summary with key findings from Supabase RAG search."""
     
     summary: str
-    key_excerpts: str
+    key_excerpts: list[Excerpt] = Field(
+        default_factory=list,
+        description="List of key excerpts with their source IDs"
+    )
 
 class ClarifyWithUser(BaseModel):
     """Model for user clarification requests."""
@@ -45,6 +67,20 @@ class ResearchQuestion(BaseModel):
     
     research_brief: str = Field(
         description="A research question that will be used to guide the research.",
+    )
+
+class DraftSelection(BaseModel):
+    """Selection of the best draft from multiple narrative drafts."""
+    
+    best_draft: int = Field(
+        description="The index of the best draft (1-indexed).",
+    )
+    reasoning: str = Field(
+        description="A short explanation of why the selected draft was chosen.",
+    )
+    referencing_inconsistencies: list[str] = Field(
+        description="A list of citation inconsistencies found in the drafts.",
+        default_factory=list
     )
 
 

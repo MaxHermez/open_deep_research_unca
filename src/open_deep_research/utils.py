@@ -3,8 +3,10 @@
 import asyncio
 import logging
 import os
+import re
 import warnings
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
@@ -30,8 +32,118 @@ from mcp import McpError
 from tavily import AsyncTavilyClient
 
 from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.prompts import summarize_webpage_prompt, summarize_supabase_prompt
+from open_deep_research.state import ResearchComplete, Summary, SupabaseSummary
+
+##########################
+# Model Initialization Utils
+##########################
+
+def init_chat_model_with_gpt5_support(
+    model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    api_key: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    configurable_fields: Optional[tuple] = None,
+    **kwargs
+) -> BaseChatModel:
+    """Initialize a chat model with special handling for GPT-5 models.
+    
+    GPT-5 models require the Responses API (/v1/responses) instead of 
+    Chat Completions API (/v1/chat/completions). LangChain's recent versions
+    of langchain-openai (0.3.0+) automatically detect GPT-5 models and use
+    the correct endpoint.
+    
+    If you're getting a 404 error with GPT-5 models, ensure you have the latest
+    version of langchain-openai:
+        pip install --upgrade langchain-openai
+    
+    Args:
+        model: Model identifier string (e.g., "openai:gpt-5", "gpt-5-nano")
+        max_tokens: Maximum tokens for completion
+        api_key: API key for authentication
+        tags: Optional tags for tracing
+        configurable_fields: Fields that can be configured at runtime
+        **kwargs: Additional arguments passed to init_chat_model
+        
+    Returns:
+        Initialized chat model instance
+    """
+    # Check if this is a GPT-5 model (if model is provided)
+    if model:
+        model_lower = model.lower()
+        is_gpt5 = 'gpt-5' in model_lower or 'gpt5' in model_lower
+        
+        if is_gpt5:
+            logging.info(f"Initializing GPT-5 model: {model}")
+            logging.info("GPT-5 models use the Responses API (/v1/responses) endpoint")
+            logging.info("Ensure langchain-openai >= 0.3.0 for GPT-5 support")
+    
+    # Initialize the model using standard init_chat_model
+    # LangChain's recent versions should automatically detect GPT-5 and use responses API
+    init_kwargs = {
+        "max_tokens": max_tokens,
+        "api_key": api_key,
+        "tags": tags,
+        "configurable_fields": configurable_fields,
+        **kwargs
+    }
+    
+    # Remove None values
+    init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
+    
+    # Call with model if provided, otherwise without it (for configurable models)
+    try:
+        if model:
+            return init_chat_model(model=model, **init_kwargs)
+        else:
+            return init_chat_model(**init_kwargs)
+    except Exception as e:
+        # Check if this is the GPT-5 endpoint error
+        error_msg = str(e)
+        if "404" in error_msg and "v1/responses" in error_msg:
+            raise RuntimeError(
+                f"GPT-5 model initialization failed. "
+                f"Please upgrade langchain-openai: pip install --upgrade langchain-openai"
+            ) from e
+        raise
+
+##########################
+# Logging Configuration
+##########################
+
+def setup_logging():
+    """Configure logging to write to a timestamped file in the logs directory."""
+    # Create logs directory if it doesn't exist
+    logs_dir = Path(__file__).parent.parent.parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    
+    # Create timestamped log file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"deep_research_{timestamp}.log"
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    
+    # Add handler to root logger to catch all logs
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    
+    # Also add to this module's logger
+    module_logger = logging.getLogger(__name__)
+    module_logger.setLevel(logging.INFO)
+    
+    logging.info(f"Logging initialized - writing to {log_file}")
+    return log_file
+
+# Initialize logging when module is imported
+_log_file_path = setup_logging()
 
 ##########################
 # Tavily Search Tool Utils
@@ -83,7 +195,7 @@ async def tavily_search(
     
     # Initialize summarization model with retry logic
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
+    summarization_model = init_chat_model_with_gpt5_support(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
@@ -192,7 +304,7 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Execute summarization with timeout to prevent hanging
         summary = await asyncio.wait_for(
             model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 60 second timeout for summarization
+            timeout=120.0  # 120 second timeout for summarization
         )
         
         # Format the summary with structured sections
@@ -211,6 +323,54 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+async def summarize_supabase_results(model: BaseChatModel, query: str, results: list) -> str:
+    """Summarize Supabase RAG search results using the summarization model.
+    
+    Args:
+        model: The chat model configured for summarization
+        query: The search query that produced these results
+        results: List of search result dictionaries from Supabase
+        
+    Returns:
+        Formatted summary with key excerpts tagged by sc_id
+    """
+    # Format results for the prompt
+    formatted_results = []
+    for result in results:
+        formatted_results.append({
+            "sc_id": result.get('id', ''),
+            "section_title": result.get('metadata', {}).get('section_title', ''),
+            "doc_title": result.get('metadata', {}).get('doc_title', ''),
+            "text": result.get('content', '')
+        })
+    
+    try:
+        summary = await asyncio.wait_for(
+            model.ainvoke([HumanMessage(content=summarize_supabase_prompt.format(
+                query=query,
+                rag_results=formatted_results,
+                date=get_today_str()
+            ))]),
+            timeout=600.0
+        )
+
+        # Format the response with excerpts tagged by sc_id
+        excerpts_text = ""
+        if hasattr(summary, 'key_excerpts') and summary.key_excerpts:
+            for excerpt in summary.key_excerpts:
+                excerpts_text += f"[{excerpt.sc_id}] {excerpt.excerpt}\n"
+
+        return f"""<summary>\n{summary.summary}\n</summary>\n\n<key_excerpts>\n{excerpts_text}</key_excerpts>"""
+    
+    except asyncio.TimeoutError:
+        # Timeout during summarization - return basic formatted content
+        logging.warning("Supabase results summarization timed out after 600 seconds, returning basic formatting")
+        return ""
+    except Exception as e:
+        # Other errors during summarization - log and return empty string to trigger fallback
+        logging.warning(f"Supabase results summarization failed with error: {str(e)}, using fallback formatting")
+        return ""
 
 ##########################
 # Reflection Tool Utils
@@ -523,6 +683,179 @@ async def load_mcp_tools(
     
     return configured_tools
 
+SUPABASE_RAG_SEARCH_DESCRIPTION = (
+    "A semantic search engine that searches through a curated knowledge base using RAG (Retrieval Augmented Generation). "
+    "Useful for finding detailed information from pre-indexed documents and research materials."
+)
+
+@tool(description=SUPABASE_RAG_SEARCH_DESCRIPTION)
+async def supabase_search(
+    queries: List[str],
+    match_count: Annotated[int, InjectedToolArg] = 5,
+    match_threshold: Annotated[float, InjectedToolArg] = 0.5,
+    config: RunnableConfig = None
+) -> str:
+    """
+    Fetches results from Supabase RAG search using semantic similarity.
+
+    Args:
+        queries (List[str]): List of search queries, you can pass in as many queries as you need.
+        match_count (int): Maximum number of results to return per query
+        match_threshold (float): Similarity threshold for matching (0-1)
+
+    Returns:
+        str: A formatted string of search results
+    """
+    try:
+        from supabase import create_client, Client
+        import openai
+        
+        # Initialize clients
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        if not supabase_url or not supabase_key:
+            error_msg = "Error: SUPABASE_URL and SUPABASE_KEY environment variables are required but not set. Please configure these in your .env file."
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+        
+        if not openai_api_key:
+            error_msg = "Error: OPENAI_API_KEY environment variable is required for embeddings but not set. Please configure this in your .env file."
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+        
+        supabase: Client = create_client(supabase_url, supabase_key)
+        openai_client = openai.OpenAI(api_key=openai_api_key)
+        
+    except ImportError as e:
+        error_msg = f"Error: supabase-py and openai packages are required for Supabase RAG search. Install with: pip install supabase openai. Details: {e}"
+        logging.error(error_msg)
+        raise ImportError(error_msg)
+    
+    logging.info(f"Supabase search executing with {len(queries)} queries")
+    
+    # Get configuration for summarization
+    configurable = Configuration.from_runnable_config(config)
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    summarization_model = init_chat_model_with_gpt5_support(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(SupabaseSummary).with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+    
+    # Collect all results from all queries
+    all_results = []
+    formatted_output = f"Search results from knowledge base: \n\n"
+    
+    for query_idx, query in enumerate(queries):
+        try:
+            logging.info(f"Executing Supabase search for query {query_idx + 1}/{len(queries)}: {query}")
+            # Generate embedding for the query
+            embedding_response = openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=query
+            )
+            query_embedding = embedding_response.data[0].embedding
+            
+            # Call Supabase RPC function
+            response = supabase.rpc(
+                'match_section_chunks',
+                {
+                    'query_embedding': query_embedding,
+                    'match_count': match_count,
+                    'filter': {}  # Empty filter as per RPC signature
+                }
+            ).execute()
+            
+            # Filter results by similarity threshold
+            filtered_results = [
+                doc for doc in response.data 
+                if doc.get('similarity', 0) >= match_threshold
+            ]
+            
+            logging.info(f"Query {query_idx + 1} returned {len(filtered_results)} results above threshold {match_threshold}")
+            
+            if filtered_results:
+                # Add query context to results
+                for result in filtered_results:
+                    result['query'] = query
+                all_results.extend(filtered_results)
+                
+        except Exception as e:
+            error_msg = f"Error executing Supabase search for query '{query}': {str(e)}"
+            logging.error(error_msg)
+            formatted_output += f"\n--- QUERY {query_idx + 1}: {query} ---\n"
+            formatted_output += f"{error_msg}\n\n"
+    
+    if not all_results:
+        logging.warning(f"No results found in Supabase for {len(queries)} queries with threshold {match_threshold}")
+        return "No relevant results found in the knowledge base. Please try different search queries or adjust the similarity threshold."
+    
+    logging.info(f"Supabase search completed: {len(all_results)} total results from {len(queries)} queries")
+    
+    # Group results by query and summarize
+    async def noop():
+        return None
+        
+    # Group results by query for summarization
+    results_by_query = {}
+    for result in all_results:
+        query = result['query']
+        if query not in results_by_query:
+            results_by_query[query] = []
+        results_by_query[query].append(result)
+    
+    # Summarize results for each query
+    summarization_tasks = []
+    for query, query_results in results_by_query.items():
+        if query_results:
+            summarization_tasks.append(
+                summarize_supabase_results(summarization_model, query, query_results)
+            )
+        else:
+            summarization_tasks.append(noop())
+    
+    summaries = await asyncio.gather(*summarization_tasks)
+    
+    # Format the final output
+    for i, (query, summary) in enumerate(zip(results_by_query.keys(), summaries)):
+        query_results = results_by_query[query]
+        formatted_output += f"\n--- QUERY {i + 1}: {query} ---\n"
+        formatted_output += f"Found {len(query_results)} relevant results\n\n"
+        
+        if summary and summary != "":
+            formatted_output += f"SUMMARY:\n{summary}\n\n"
+        else:
+            # Fallback to basic formatting if summarization failed
+            for j, doc in enumerate(query_results):
+                metadata = doc.get('metadata', {})
+                doc_title = metadata.get('doc_title', '')
+                section_title = metadata.get('section_title', '')
+                sc_id = doc.get('sc_id', '')
+                
+                if doc_title and section_title:
+                    title = f"{doc_title} - Section: {section_title}"
+                elif doc_title:
+                    title = doc_title
+                elif section_title:
+                    title = section_title
+                else:
+                    title = f"Document Chunk {j+1}"
+                
+                content = doc.get('content', '')
+                similarity = doc.get('similarity', 0.0)
+
+                formatted_output += f"SOURCE {j + 1}: {sc_id}\n"
+                formatted_output += f"Title: {title}\n"
+                formatted_output += f"Relevance: {similarity:.3f}\n"
+                formatted_output += f"CONTENT:\n{content[:1000]}{'...' if len(content) > 1000 else ''}\n\n"
+        
+        formatted_output += "-" * 80 + "\n\n"
+    
+    return formatted_output
+
 
 ##########################
 # Tool Utils
@@ -558,7 +891,15 @@ async def get_search_tool(search_api: SearchAPI):
             "name": "web_search"
         }
         return [search_tool]
-        
+    elif search_api == SearchAPI.SUPABASE:
+        # Configure Supabase search tool with metadata
+        search_tool = supabase_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}), 
+            "type": "search", 
+            "name": "supabase_search"  # Keep original name for trace clarity
+        }
+        return [search_tool]
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []
@@ -923,3 +1264,181 @@ def get_tavily_api_key(config: RunnableConfig):
         return api_keys.get("TAVILY_API_KEY")
     else:
         return os.getenv("TAVILY_API_KEY")
+
+def md_cite_sc_ids(text: str):
+    ID_PATTERN     = r'\[?\^?\d+\]?\.?\sID:\s*(sc_[^\s,)]+)'        # capture group 1  ->  sc_xxxxxxx
+    PAREN_PATTERN  = r'\(([^)]*ID:\s*sc_[^)]*)\)'  # any (…) that contains at least one ID:
+    # PAREN_PATTERN = r'(?<!^\d\.\s)\(([^)]*ID:\s*sc_[^)]*)\)'
+    BARE_FOOTNOTE  = r'\[(?!\^)(\d+)\]'
+    # 1) collect IDs in first-appearance order ----------------------------
+    sc_id_matches = re.findall(ID_PATTERN, text)
+    unique_sc_ids = []
+    for m in sc_id_matches:
+        if m not in unique_sc_ids:
+            unique_sc_ids.append(m)
+    footnote_map = {sc_id: i + 1 for i, sc_id in enumerate(unique_sc_ids)}
+
+    # 2) replace IDs that live inside parentheses -------------------------
+    text = re.sub(PAREN_PATTERN, '', text).strip()
+
+    # 3) replace any remaining standalone IDs -----------------------------
+    # Previous approach removed only the matched portion, leaving one blank line per reference.
+    # Consume the entire line (and its trailing newline) for any remaining ID lines to avoid
+    # accumulating blank lines where references were listed, especially at document end.
+    FULL_ID_LINE_PATTERN = r'(?m)^\s*\[?\^?\d+\]?\.?\sID:\s*sc_[^\s,)]+'  # matches full line with ID
+    text = re.sub(FULL_ID_LINE_PATTERN + r'(?:\s*\n)?', '', text)
+    text = re.sub(ID_PATTERN, '', text).strip()  # fallback (in-case of embedded patterns)
+
+    # Collapse any runs of 3+ blank lines to just two (paragraph break) before footnotes.
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # 4) convert bare numeric refs like “[1]” → “[^^1]” -------------------
+    text = re.sub(BARE_FOOTNOTE, r' [^\1] ', text).strip()
+
+    # 5) append the footnote block ----------------------------------------
+    footnotes = [f'[^{num}]: {sc_id}' for sc_id, num in footnote_map.items()]
+    text += '\n\n' + '\n'.join(footnotes).strip()
+    return text, footnote_map
+
+def _normalize_title(s: str) -> str:
+    # Casefold, trim, collapse spaces, drop trailing period
+    s = s.strip().rstrip('.')
+    s = re.sub(r'\s+', ' ', s)
+    return s.casefold()
+
+def dedupe_and_renumber_footnotes(md: str) -> str:
+    # Find "### Sources" heading
+    HEADING_PATTERN = re.compile(r'(?im)^\s*#{1,6}\s*Sources\s*$', re.M)
+    DEF_PATTERN = re.compile(r'(?im)^\s*\[\^(\d+)\]:\s*(.+?)\s*$', re.M)
+    REF_PATTERN = re.compile(r'\[\^(\d+)\]')
+    h = HEADING_PATTERN.search(md)
+    if not h:
+        return md  # nothing to do
+
+    # Split body / sources (everything after the heading line is considered sources block)
+    heading_line_end = md.find('\n', h.end())
+    if heading_line_end == -1:
+        body, sources_block = md[:h.start()], ''
+    else:
+        body, sources_block = md[:h.start()], md[heading_line_end + 1 :]
+
+    # Parse definitions: old_num -> original_title
+    defs: Dict[int, str] = {int(n): t.strip() for n, t in DEF_PATTERN.findall(sources_block)}
+    if not defs:
+        return md  # no definitions found
+
+    # Map normalized title -> first-seen original title (stable representative)
+    title_by_norm: Dict[str, str] = {}
+    for old_num in sorted(defs):
+        t = defs[old_num]
+        n = _normalize_title(t)
+        if n not in title_by_norm:
+            title_by_norm[n] = t
+
+    # Assign new numbers in order of first appearance in the BODY
+    norm_to_new: Dict[str, int] = {}
+    counter = 1
+    for m in REF_PATTERN.finditer(body):
+        old = int(m.group(1))
+        if old not in defs:
+            continue  # unknown reference, leave as-is
+        n = _normalize_title(defs[old])
+        if n not in norm_to_new:
+            norm_to_new[n] = counter
+            counter += 1
+
+    # Replace inline references with new indices (only if known & used)
+    def _replace_ref(m: re.Match) -> str:
+        old = int(m.group(1))
+        if old not in defs:
+            return m.group(0)  # unknown: keep
+        n = _normalize_title(defs[old])
+        new_idx = norm_to_new.get(n)
+        return f'[^{new_idx}]' if new_idx else m.group(0)
+
+    new_body = REF_PATTERN.sub(_replace_ref, body).rstrip()
+
+    # Rebuild de-duplicated Sources list in new order
+    if norm_to_new:
+        max_new = max(norm_to_new.values())
+        new_defs = []
+        # inverse map: index -> normalized title
+        idx_to_norm = {v: k for k, v in norm_to_new.items()}
+        for i in range(1, max_new + 1):
+            n = idx_to_norm.get(i)
+            if n is None:
+                continue
+            title = title_by_norm.get(n, '')
+            new_defs.append(f'[^{i}]: {title}')
+        new_sources = '### Sources\n\n' + '\n'.join(new_defs) + '\n'
+    else:
+        # No known refs used in body → keep an empty Sources heading
+        new_sources = '### Sources\n'
+
+    return new_body + '\n\n' + new_sources
+
+async def format_citations(text: str) -> str:
+    """Formats citations in the text to use Markdown-style footnotes.
+    
+    Retrieves citation metadata from Supabase and converts sc_ids to proper
+    footnote references with source information.
+    
+    Args:
+        text: The input text containing sc_id citations
+        
+    Returns:
+        The formatted text with deduplicated and renumbered footnotes
+    """
+    try:
+        from supabase import create_client, Client
+        
+        # Initialize Supabase client
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        
+        if not supabase_url or not supabase_key:
+            logging.warning("SUPABASE_URL or SUPABASE_KEY not set, returning text without citation formatting")
+            return text
+        
+        supabase: Client = create_client(supabase_url, supabase_key)
+        
+    except ImportError:
+        logging.warning("supabase-py package not installed, returning text without citation formatting")
+        return text
+    
+    # Extract sc_ids and create initial footnotes
+    out, footnote_map = md_cite_sc_ids(text)
+    
+    if not footnote_map:
+        return text
+    
+    # Fetch reference data from Supabase
+    try:
+        # ref_data = supabase.table("ref_info").select(
+        #     "sc_id, doc_title, page_start, page_end"
+        # ).in_(
+        #     "sc_id", list(footnote_map.keys())
+        # ).execute().data
+        ref_data = []
+        sc_ids = list(footnote_map.keys())
+        batch_size = 50
+
+        for i in range(0, len(sc_ids), batch_size):
+            batch = sc_ids[i:i + batch_size]
+            batch_data = supabase.table("ref_info").select("sc_id, doc_title, page_start, page_end").in_("sc_id", batch).execute().data
+            ref_data.extend(batch_data)
+        
+        # Replace sc_ids with formatted titles
+        for each in ref_data:
+            # Option to include page numbers (currently commented out):
+            # formatted = f"{each['doc_title'].title()} p{each['page_start']}{'-'+str(each['page_end']) if each['page_start'] != each['page_end'] else ''}"
+            # formatted = f"{each['doc_title'].title()}, {each['page_start']}"
+            formatted = f"{each['doc_title'].title()}"
+            out = out.replace(each['sc_id'], formatted)
+        
+    except Exception as e:
+        logging.warning(f"Failed to fetch citation data from Supabase: {str(e)}")
+    
+    # Deduplicate and renumber footnotes
+    out = dedupe_and_renumber_footnotes(out)
+    return out
